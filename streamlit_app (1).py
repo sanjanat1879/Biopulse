@@ -4,11 +4,14 @@ Accounts: a patient signs in with name + phone number / email. A caregiver signs
 details plus the 4-digit caregiver PIN. Every record belongs to one patient, so nobody sees another
 patient's medicines. Only the caregiver adds / removes medicines and chooses their times.
 
+If "Keep me signed in" is ticked, the browser keeps a random login token for 30 days, so the patient / caregiver
+does not have to sign in every time (needs Streamlit 1.37+). Signing out or changing the PIN ends it.
+
 Times are chosen and shown in 12-hour AM/PM format. If the patient has not confirmed a dose (taken / missed)
 within ALERT_AFTER minutes, a red alert appears at the top of the caregiver dashboard until the caregiver
 presses "Got it" (or the patient confirms the dose).
 """
-import hashlib, hmac, json, os, re, sqlite3
+import hashlib, hmac, json, os, re, secrets, sqlite3
 import datetime as dt
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -25,6 +28,8 @@ DEFAULT_TIMES = ["08:00", "13:00", "18:00", "21:00", "10:00", "15:00"]  # only s
 MAX_DOSES = 6
 ALERT_AFTER = 15    # minutes after the dose time with no response -> alert on caregiver dashboard (must be < GRACE)
 DB_PATH = "medminder_accounts.db"
+SESSION_DAYS = 30   # "Keep me signed in" lasts this many days on that browser
+COOKIE = "mm_token"
 LANGS = {"English": ("en", "en-IN"), "हिन्दी": ("hi", "hi-IN"), "தமிழ்": ("ta", "ta-IN")}
 
 T = {
@@ -36,7 +41,7 @@ T = {
   pin="Caregiver PIN (4 digits)", history="Last 7 days", attention="Needs attention", due="Time for your medicine",
   none_m="No doses today.", none_a="No upcoming appointments.", done="doses taken", nomiss="Nothing missed today.",
   remind="Time to take", voice="Alerts refresh every 30 seconds while this page is open.",
-  signin="Sign in", create="Create account", pname="Patient name", contact="Phone number or email",
+  keep="Keep me signed in for 30 days", signin="Sign in", create="Create account", pname="Patient name", contact="Phone number or email",
   signin_as="Sign in as", invalid="Details do not match. Please check and try again.",
   bad_contact="Enter a valid 10-digit phone number or an email address.",
   exists="An account with this phone/email already exists. Please sign in.", need_name="Please enter the patient name.",
@@ -55,7 +60,7 @@ T = {
   attention="ध्यान देने योग्य", due="दवा का समय हो गया", none_m="आज कोई खुराक नहीं।",
   none_a="कोई आने वाला अपॉइंटमेंट नहीं।", done="खुराक ली गईं", nomiss="आज कोई खुराक नहीं छूटी।",
   remind="दवा लेने का समय:", voice="यह पेज खुला रहने पर अलर्ट हर 30 सेकंड में अपडेट होते हैं।",
-  signin="साइन इन", create="खाता बनाएँ", pname="मरीज़ का नाम", contact="फ़ोन नंबर या ईमेल",
+  keep="30 दिन तक साइन इन रखें", signin="साइन इन", create="खाता बनाएँ", pname="मरीज़ का नाम", contact="फ़ोन नंबर या ईमेल",
   signin_as="इस रूप में साइन इन करें", invalid="विवरण मेल नहीं खाते। कृपया जाँचकर फिर कोशिश करें।",
   bad_contact="सही 10 अंकों का फ़ोन नंबर या ईमेल दर्ज करें।",
   exists="इस फ़ोन/ईमेल से खाता पहले से है। कृपया साइन इन करें।", need_name="कृपया मरीज़ का नाम लिखें।",
@@ -76,7 +81,7 @@ T = {
   none_m="இன்று அளவுகள் இல்லை.", none_a="வரவிருக்கும் சந்திப்புகள் இல்லை.", done="அளவுகள் எடுக்கப்பட்டன",
   nomiss="இன்று எதுவும் தவறவில்லை.", remind="மருந்து எடுக்கும் நேரம்:",
   voice="இந்தப் பக்கம் திறந்திருக்கும் வரை அறிவிப்புகள் 30 விநாடிகளுக்கு ஒருமுறை புதுப்பிக்கப்படும்.",
-  signin="உள்நுழை", create="கணக்கை உருவாக்கு", pname="நோயாளியின் பெயர்", contact="தொலைபேசி எண் அல்லது மின்னஞ்சல்",
+  keep="30 நாட்களுக்கு உள்நுழைந்தே வைத்திரு", signin="உள்நுழை", create="கணக்கை உருவாக்கு", pname="நோயாளியின் பெயர்", contact="தொலைபேசி எண் அல்லது மின்னஞ்சல்",
   signin_as="இவராக உள்நுழை", invalid="விவரங்கள் பொருந்தவில்லை. சரிபார்த்து மீண்டும் முயற்சிக்கவும்.",
   bad_contact="சரியான 10 இலக்க தொலைபேசி எண் அல்லது மின்னஞ்சலை உள்ளிடவும்.",
   exists="இந்த தொலைபேசி/மின்னஞ்சலில் ஏற்கனவே கணக்கு உள்ளது. உள்நுழையவும்.", need_name="நோயாளியின் பெயரை உள்ளிடவும்.",
@@ -113,6 +118,7 @@ def conn():
         times text, created text, created_time text);
     create table if not exists dose_log(id integer primary key, med_id integer, patient_id integer, day text, time text,
         status text default 'pending', auto integer default 0, unique(med_id,day,time));
+    create table if not exists sessions(token_hash text primary key, patient_id integer, role text, expires text);
     create table if not exists appointments(id integer primary key, patient_id integer, doctor text, day text,
         time text, note text);
     """)
@@ -159,8 +165,61 @@ def find_patient(name, contact):
     return r if r and r["name"].casefold() == norm_name(name).casefold() else None
 
 
-def login(row, role):
+def _h(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()   # only the hash of the token is stored in the database
+
+
+def new_session(pid, role):
+    """Create a 'keep me signed in' token for this browser (valid SESSION_DAYS days)."""
+    tok = secrets.token_urlsafe(32)
+    db.execute("delete from sessions where expires < ?", (now().isoformat(),))
+    db.execute("insert into sessions(token_hash,patient_id,role,expires) values(?,?,?,?)",
+               (_h(tok), pid, role, (now() + dt.timedelta(days=SESSION_DAYS)).isoformat()))
+    db.commit()
+    return tok
+
+
+def browser_token():
+    try:
+        return st.context.cookies.get(COOKIE)   # needs Streamlit 1.37+
+    except Exception:
+        return None
+
+
+def restore_session():
+    """Sign in automatically if this browser holds a valid, unexpired token."""
+    tok = browser_token()
+    if not tok:
+        return
+    r = db.execute("select * from sessions where token_hash=?", (_h(tok),)).fetchone()
+    if not r or r["expires"] < now().isoformat():
+        return
+    p = db.execute("select * from patients where id=?", (r["patient_id"],)).fetchone()
+    if p:
+        st.session_state.update(pid=p["id"], pname=p["name"], contact=p["contact"], role=r["role"],
+                                spoken=set(), _tok=tok)
+
+
+def end_session():
+    for tok in {st.session_state.get("_tok"), browser_token()} - {None}:
+        db.execute("delete from sessions where token_hash=?", (_h(tok),))
+    db.commit()
+
+
+def cookie_js(value):
+    """Set (or, with value='', delete) the login cookie in the browser."""
+    age = SESSION_DAYS * 86400 if value else 0
+    components.html(f"""<script>
+    const p = window.parent, s = p.location.protocol === 'https:' ? ';Secure' : '';
+    p.document.cookie = '{COOKIE}={value};max-age={age};path=/;SameSite=Lax' + s;
+    </script>""", height=0)
+
+
+def login(row, role, remember=False):
     st.session_state.update(pid=row["id"], pname=row["name"], contact=row["contact"], role=role, spoken=set())
+    if remember:
+        tok = new_session(row["id"], role)
+        st.session_state.update(_tok=tok, _set_cookie=tok)
     st.rerun()
 
 
@@ -261,6 +320,8 @@ st.title(f"💊 {t['title']}")
 st.caption(t["sub"])
 
 # ---------------- sign in / create account ----------------
+if "pid" not in st.session_state:
+    restore_session()   # "keep me signed in" cookie -> skip the sign-in screen
 if "pid" in st.session_state and not db.execute(
         "select 1 from patients where id=?", (st.session_state["pid"],)).fetchone():
     st.session_state.clear(); st.rerun()
@@ -273,11 +334,12 @@ if "pid" not in st.session_state:
             n_in = st.text_input(t["pname"])
             c_in = st.text_input(t["contact"])
             p_in = st.text_input(t["pin"], type="password", max_chars=4) if role_label == t["caregiver"] else ""
+            keep_in = st.checkbox(t["keep"], value=True)
             if st.form_submit_button(t["signin"], use_container_width=True):
                 row = find_patient(n_in, c_in)
                 is_cg = role_label == t["caregiver"]
                 if row and (not is_cg or (p_in and check_pin(p_in, row["pin_hash"]))):
-                    login(row, "caregiver" if is_cg else "patient")
+                    login(row, "caregiver" if is_cg else "patient", keep_in)
                 else:
                     st.error(t["invalid"])
     with tab_new:
@@ -300,6 +362,8 @@ if "pid" not in st.session_state:
                                      (norm_name(n_new), c_norm, hash_pin(p_new)))
                     db.commit()
                     login(db.execute("select * from patients where id=?", (cur.lastrowid,)).fetchone(), "patient")
+    if st.session_state.pop("_clear_cookie", False):
+        cookie_js("")
     disclaimer(t)
     st.stop()
 
@@ -308,7 +372,10 @@ pid, role, pname = st.session_state["pid"], st.session_state["role"], st.session
 st.sidebar.write(f"{t['signed']} **{pname}**")
 st.sidebar.caption(t["caregiver"] if role == "caregiver" else t["patient"])
 if st.sidebar.button(t["signout"], use_container_width=True):
-    st.session_state.clear(); st.rerun()
+    end_session()
+    st.session_state.clear(); st.session_state["_clear_cookie"] = True; st.rerun()
+if st.session_state.get("_set_cookie"):
+    cookie_js(st.session_state.pop("_set_cookie"))
 if st_autorefresh:
     st_autorefresh(interval=30000, key="tick")
 
@@ -441,7 +508,8 @@ with st.sidebar.expander(t["change_pin"]):
         np_ = st.text_input(t["new_pin"], type="password", max_chars=4)
         if st.form_submit_button(t["save"], use_container_width=True):
             if np_.isdigit() and len(np_) == 4:
-                db.execute("update patients set pin_hash=? where id=?", (hash_pin(np_), pid)); db.commit()
+                db.execute("update patients set pin_hash=? where id=?", (hash_pin(np_), pid))
+                db.execute("delete from sessions where patient_id=? and role='caregiver'", (pid,)); db.commit()
                 st.success(t["pin_saved"])
             else:
                 st.error(t["bad_pin"])
