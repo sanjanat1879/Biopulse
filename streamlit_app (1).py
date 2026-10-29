@@ -5,18 +5,11 @@ details plus the 4-digit caregiver PIN. Every record belongs to one patient, so 
 patient's medicines. Only the caregiver adds / removes medicines and chooses their times.
 
 Times are chosen and shown in 12-hour AM/PM format. If the patient has not confirmed a dose (taken / missed)
-within ALERT_AFTER minutes, an alert is sent to the contact entered at sign-in: an SMS if it is a phone number,
-an email if it is an email address. A background thread checks every 30 s, so alerts go out even when nobody
-has the page open (the Streamlit server itself must be running).
-
-ALERT SETUP (environment variables or .streamlit/secrets.toml - never hard-code passwords here):
-  Email : SMTP_HOST, SMTP_PORT (587 or 465), SMTP_USER, SMTP_PASSWORD, SMTP_FROM (optional)
-          e.g. Gmail: smtp.gmail.com / 587 / your address / a Google "App password"
-  SMS   : TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM (your Twilio number, e.g. +1415...)
+within ALERT_AFTER minutes, a red alert appears at the top of the caregiver dashboard until the caregiver
+presses "Got it" (or the patient confirms the dose).
 """
-import base64, hashlib, hmac, json, os, re, smtplib, sqlite3, threading, time, urllib.parse, urllib.request
+import hashlib, hmac, json, os, re, sqlite3
 import datetime as dt
-from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
@@ -30,12 +23,8 @@ except ImportError:
 TZ, GRACE = ZoneInfo("Asia/Kolkata"), 30  # minutes before an unconfirmed dose is marked missed
 DEFAULT_TIMES = ["08:00", "13:00", "18:00", "21:00", "10:00", "15:00"]  # only starting suggestions; all editable
 MAX_DOSES = 6
-ALERT_AFTER = 15    # minutes after the dose time with no response -> alert the caregiver (must be < GRACE)
-ALERT_WINDOW = 180  # never alert for doses older than this many minutes (avoids floods after downtime)
-COUNTRY_CODE = "+91"  # prefix added to 10-digit phone numbers for SMS
+ALERT_AFTER = 15    # minutes after the dose time with no response -> alert on caregiver dashboard (must be < GRACE)
 DB_PATH = "medminder_accounts.db"
-CFG_KEYS = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM",
-            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM"]
 LANGS = {"English": ("en", "en-IN"), "हिन्दी": ("hi", "hi-IN"), "தமிழ்": ("ta", "ta-IN")}
 
 T = {
@@ -102,22 +91,9 @@ T = {
   disc="இந்த செயலி மருத்துவரின் அறிவுறுத்தலின்படி உள்ளிட்ட அட்டவணையை மட்டுமே பின்பற்றும். மருந்துகளைப் பரிந்துரைக்காது, அளவை மாற்றாது."),
 }
 
-T["en"].update(alert_note="Missed-dose alerts are sent to this number (SMS) or email.", alerts="Caregiver alerts",
-  alert_to="Alerts are sent to", alert_sms="SMS", alert_mail="email", alert_sent="alert sent", alert_failed="alert failed",
-  alert_rule="If the patient does not confirm a dose within {m} minutes, an alert is sent.",
-  alert_off="Alerts are not set up yet for this type of contact. Add the settings listed at the top of the app file and restart.",
-  test_alert="Send test alert", test_ok="Test alert sent", test_fail="Could not send")
-T["hi"].update(alert_note="छूटी खुराक के अलर्ट इस नंबर (SMS) या ईमेल पर भेजे जाएँगे।", alerts="देखभालकर्ता अलर्ट",
-  alert_to="अलर्ट यहाँ भेजे जाते हैं", alert_sms="SMS", alert_mail="ईमेल", alert_sent="अलर्ट भेजा गया", alert_failed="अलर्ट विफल",
-  alert_rule="अगर मरीज़ {m} मिनट में खुराक की पुष्टि नहीं करता, तो अलर्ट भेजा जाता है।",
-  alert_off="इस तरह के संपर्क के लिए अलर्ट अभी सेट नहीं हैं। ऐप फ़ाइल के ऊपर दी गई सेटिंग जोड़ें और रीस्टार्ट करें।",
-  test_alert="टेस्ट अलर्ट भेजें", test_ok="टेस्ट अलर्ट भेजा गया", test_fail="भेजा नहीं जा सका")
-T["ta"].update(alert_note="தவறிய அளவு எச்சரிக்கைகள் இந்த எண்ணுக்கு (SMS) அல்லது மின்னஞ்சலுக்கு அனுப்பப்படும்.",
-  alerts="பராமரிப்பாளர் எச்சரிக்கைகள்", alert_to="எச்சரிக்கைகள் அனுப்பப்படுவது", alert_sms="SMS", alert_mail="மின்னஞ்சல்",
-  alert_sent="எச்சரிக்கை அனுப்பப்பட்டது", alert_failed="எச்சரிக்கை தோல்வி",
-  alert_rule="நோயாளி {m} நிமிடங்களில் அளவை உறுதிப்படுத்தாவிட்டால் எச்சரிக்கை அனுப்பப்படும்.",
-  alert_off="இந்த வகை தொடர்புக்கு எச்சரிக்கைகள் இன்னும் அமைக்கப்படவில்லை. செயலி கோப்பின் மேலே உள்ள அமைப்புகளைச் சேர்த்து மீண்டும் தொடங்கவும்.",
-  test_alert="சோதனை எச்சரிக்கை அனுப்பு", test_ok="சோதனை எச்சரிக்கை அனுப்பப்பட்டது", test_fail="அனுப்ப முடியவில்லை")
+T["en"].update(dash_alert="No response from patient", ack="Got it", min="min late")
+T["hi"].update(dash_alert="मरीज़ की ओर से कोई जवाब नहीं", ack="ठीक है", min="मिनट देर")
+T["ta"].update(dash_alert="நோயாளியிடமிருந்து பதில் இல்லை", ack="சரி", min="நிமிடம் தாமதம்")
 
 st.set_page_config(page_title="MedMinder", page_icon="💊", layout="centered")
 st.markdown("""<style>html,body,[class*="css"]{font-size:19px}
@@ -140,8 +116,8 @@ def conn():
     create table if not exists appointments(id integer primary key, patient_id integer, doctor text, day text,
         time text, note text);
     """)
-    if "alert_state" not in [r[1] for r in c.execute("pragma table_info(dose_log)")]:
-        c.execute("alter table dose_log add column alert_state text default ''")  # '', sending, sent, failed:<why>
+    if "cg_ack" not in [r[1] for r in c.execute("pragma table_info(dose_log)")]:
+        c.execute("alter table dose_log add column cg_ack integer default 0")  # caregiver pressed "Got it"
     c.commit()
     return c
 
@@ -215,108 +191,23 @@ def time_pick(label, key, default="08:00", optional=False):
     return f"{(int(hs) % 12) + (12 if ps == 'PM' else 0):02d}:{ms}"
 
 
-# ---------------- caregiver alerts (SMS / email) ----------------
-def load_cfg():
-    out = {}
-    for k in CFG_KEYS:
-        v = os.environ.get(k)
-        if not v:
-            try:
-                v = st.secrets.get(k)
-            except Exception:
-                v = None
-        out[k] = str(v) if v else ""
-    return out
-
-
-def alert_ready(cfg, contact):
-    keys = ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD") if "@" in contact else \
-           ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM")
-    return all(cfg.get(k) for k in keys)
-
-
-def notify(cfg, contact, subject, body):
-    """Email if `contact` is an address, SMS if it is a phone number. Returns (ok, detail)."""
-    if not alert_ready(cfg, contact):
-        return False, "not configured"
-    try:
-        if "@" in contact:
-            msg = EmailMessage()
-            msg["Subject"], msg["From"], msg["To"] = subject, cfg["SMTP_FROM"] or cfg["SMTP_USER"], contact
-            msg.set_content(body)
-            port = int(cfg["SMTP_PORT"] or 587)
-            if port == 465:
-                with smtplib.SMTP_SSL(cfg["SMTP_HOST"], port, timeout=20) as s:
-                    s.login(cfg["SMTP_USER"], cfg["SMTP_PASSWORD"]); s.send_message(msg)
-            else:
-                with smtplib.SMTP(cfg["SMTP_HOST"], port, timeout=20) as s:
-                    s.starttls(); s.login(cfg["SMTP_USER"], cfg["SMTP_PASSWORD"]); s.send_message(msg)
-        else:
-            sid = cfg["TWILIO_ACCOUNT_SID"]
-            req = urllib.request.Request(
-                f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                data=urllib.parse.urlencode({"To": COUNTRY_CODE + contact, "From": cfg["TWILIO_FROM"], "Body": body}).encode())
-            req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{cfg['TWILIO_AUTH_TOKEN']}".encode()).decode())
-            urllib.request.urlopen(req, timeout=20).close()
-        return True, ""
-    except Exception as e:
-        return False, str(e)[:120]
-
-
 # ---------------- data ----------------
-def check_patient(c, p, cfg):
-    """Create today's dose rows, alert the caregiver about unconfirmed doses, then auto-mark long-overdue ones missed.
-    `c` is a sqlite connection, `p` a patients row. Safe to call from the page and from the background thread."""
-    n = now(); today = n.date().isoformat(); pid = p["id"]
-    for m in c.execute("select * from medicines where patient_id=?", (pid,)).fetchall():
+def check_patient(pid):
+    """Create today's dose rows and auto-mark long-overdue unanswered doses as missed."""
+    n = now(); today = n.date().isoformat()
+    for m in db.execute("select * from medicines where patient_id=?", (pid,)).fetchall():
         for tm_ in m["times"].split(","):
             if m["created"] == today and tm_ < m["created_time"]:
                 continue
-            c.execute("insert or ignore into dose_log(med_id,patient_id,day,time) values(?,?,?,?)", (m["id"], pid, today, tm_))
-    c.commit()
-    pending = c.execute("""select l.id,l.day,l.time,m.name from dose_log l join medicines m on m.id=l.med_id
-                           where l.patient_id=? and l.status='pending'""", (pid,)).fetchall()
-    for r in pending:
-        due = dt.datetime.fromisoformat(f"{r['day']}T{r['time']}")
-        late = n - due
-        if dt.timedelta(minutes=ALERT_AFTER) <= late <= dt.timedelta(minutes=ALERT_WINDOW):
-            # claim first so the page and the background thread never send the same alert twice
-            claimed = c.execute("update dose_log set alert_state='sending' where id=? and coalesce(alert_state,'')=''",
-                                (r["id"],)).rowcount
-            c.commit()
-            if claimed:
-                ok, info = notify(cfg, p["contact"], f"MedMinder: {p['name']} has not confirmed a dose",
-                                  f"MedMinder alert: {p['name']} has not confirmed {r['name']} "
-                                  f"(due {fmt12(r['time'])}). Please check on them.")
-                c.execute("update dose_log set alert_state=? where id=?", ("sent" if ok else f"failed:{info}", r["id"]))
-                c.commit()
-        if late > dt.timedelta(minutes=GRACE):
-            c.execute("update dose_log set status='missed', auto=1 where id=? and status='pending'", (r["id"],))
-    c.commit()
-
-
-@st.cache_resource
-def start_watcher():
-    """Background thread: checks every patient every 30 s so alerts are sent even with no browser open."""
-    cfg = load_cfg()
-
-    def loop():
-        c = sqlite3.connect(DB_PATH, timeout=10)
-        c.row_factory = sqlite3.Row
-        while True:
-            try:
-                for p in c.execute("select * from patients").fetchall():
-                    check_patient(c, p, cfg)
-            except Exception:
-                pass
-            time.sleep(30)
-
-    threading.Thread(target=loop, daemon=True).start()
-    return cfg
+            db.execute("insert or ignore into dose_log(med_id,patient_id,day,time) values(?,?,?,?)", (m["id"], pid, today, tm_))
+    for r in db.execute("select id,day,time from dose_log where patient_id=? and status='pending'", (pid,)).fetchall():
+        if n > dt.datetime.fromisoformat(f"{r['day']}T{r['time']}") + dt.timedelta(minutes=GRACE):
+            db.execute("update dose_log set status='missed', auto=1 where id=?", (r["id"],))
+    db.commit()
 
 
 def data(pid):
-    check_patient(db, db.execute("select * from patients where id=?", (pid,)).fetchone(), CFG)
+    check_patient(pid)
     today = now().date().isoformat()
     doses = db.execute("""select l.*, m.name, m.dose, m.food from dose_log l join medicines m on m.id=l.med_id
         where l.patient_id=? and day=? order by time""", (pid, today)).fetchall()
@@ -362,8 +253,6 @@ def disclaimer(t):
     st.markdown(f"<div class='disc'>{t['disc']}</div>", unsafe_allow_html=True)
 
 
-CFG = start_watcher()
-
 # ---------------- sidebar: language ----------------
 lang_name = st.sidebar.selectbox("🌐", list(LANGS), key="lang")
 code, voice = LANGS[lang_name]
@@ -395,7 +284,6 @@ if "pid" not in st.session_state:
         with st.form("register"):
             n_new = st.text_input(t["pname"])
             c_new = st.text_input(t["contact"])
-            st.caption(t["alert_note"])
             p_new = st.text_input(t["pin"], type="password", max_chars=4)
             if st.form_submit_button(t["create"], use_container_width=True):
                 c_norm = norm_contact(c_new)
@@ -440,6 +328,23 @@ def read_only_meds():
 # ================= caregiver =================
 if role == "caregiver":
     st.subheader(f"{t['cg_for']} {pname}")
+
+    # ---- live alerts: doses the patient has not answered ----
+    spoken = st.session_state.setdefault("spoken", set())
+    new_alerts = []
+    for d in doses:
+        late = int((now() - dt.datetime.fromisoformat(f"{d['day']}T{d['time']}")).total_seconds() // 60)
+        no_reply = d["status"] == "pending" or (d["status"] == "missed" and d["auto"])
+        if no_reply and late >= ALERT_AFTER and not d["cg_ack"]:
+            c1, c2 = st.columns([4, 1])
+            c1.error(f"🚨 {t['dash_alert']}: **{d['name']}** · {fmt12(d['time'])} ({late} {t['min']})")
+            if c2.button(t["ack"], key=f"ack{d['id']}", use_container_width=True):
+                db.execute("update dose_log set cg_ack=1 where id=? and patient_id=?", (d["id"], pid))
+                db.commit(); st.rerun()
+            if ("cg", d["id"]) not in spoken:
+                new_alerts.append(d); spoken.add(("cg", d["id"]))
+    if new_alerts:
+        speak([f"{pname}: {t['dash_alert']} - {d['name']}" for d in new_alerts], voice, t["dash_alert"])
     tab_over, tab_meds, tab_appt = st.tabs([t["overview"], t["meds"], t["appts"]])
 
     with tab_over:
@@ -452,20 +357,7 @@ if role == "caregiver":
         if not doses:
             st.info(t["none_m"])
         for d in doses:
-            a_state = d["alert_state"] or ""
-            tag = f" · 🔔 {t['alert_sent']}" if a_state == "sent" else (
-                  f" · ⚠ {t['alert_failed']}" if a_state.startswith("failed") else "")
-            st.write(f"**{d['name']}** · {fmt12(d['time'])} · {food_label(t, d['food'])} — {t[d['status']]}{tag}")
-        contact = st.session_state.get("contact", "")
-        with st.expander(t["alerts"]):
-            st.write(f"{t['alert_to']}: **{contact}** ({t['alert_mail'] if '@' in contact else t['alert_sms']})")
-            st.caption(t["alert_rule"].format(m=ALERT_AFTER))
-            if not alert_ready(CFG, contact):
-                st.warning(t["alert_off"])
-            if st.button(t["test_alert"], key="test_alert"):
-                ok, info = notify(CFG, contact, "MedMinder test alert",
-                                  f"MedMinder test: alerts for {pname} are working.")
-                st.success(t["test_ok"]) if ok else st.error(f"{t['test_fail']}: {info}")
+            st.write(f"**{d['name']}** · {fmt12(d['time'])} · {food_label(t, d['food'])} — {t[d['status']]}")
         summary(t, doses, hist, appts)
 
     with tab_meds:
