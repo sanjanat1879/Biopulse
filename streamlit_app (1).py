@@ -171,7 +171,14 @@ if mode == t["caregiver"]:
             summary(t, doses, hist, appts)
             st.subheader(t["meds"])
             for m in meds:
-                st.write(f"**{m['name']}** · {m['times']} {('· ' + m['dose']) if m['dose'] else ''}")
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"**{m['name']}** · {m['times']} {('· ' + m['dose']) if m['dose'] else ''}")
+                if c2.button(t["delete"], key=f"caregiver_dm{m['id']}", use_container_width=True):
+                    # Remove the medicine and its associated dose history.
+                    db.execute("delete from dose_log where med_id=?", (m["id"],))
+                    db.execute("delete from medicines where id=?", (m["id"],))
+                    db.commit()
+                    st.rerun()
     st.markdown(f"<div class='disc'>{t['disc']}</div>", unsafe_allow_html=True)
     st.stop()
 
