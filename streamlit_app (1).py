@@ -4,11 +4,15 @@ Accounts: a patient signs in with name + phone number / email. A caregiver signs
 details plus the 4-digit caregiver PIN. Every record belongs to one patient, so nobody sees another
 patient's medicines. Only the caregiver adds / removes medicines and chooses their times.
 
+The caregiver sets a "robot reminder time" (minutes): after a dose time the robot repeats the spoken reminder about
+every minute for that long, or until the patient marks the dose.
+
 Times are chosen and shown in 12-hour AM/PM format. If the patient has not confirmed a dose (taken / missed)
 within ALERT_AFTER minutes, a red alert appears at the top of the caregiver dashboard until the caregiver
 presses "Got it" (or the patient confirms the dose).
 """
-import hashlib, hmac, json, os, re, sqlite3
+import base64, hashlib, hmac, json, os, re, sqlite3
+from html import escape as esc
 import datetime as dt
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -23,6 +27,8 @@ except ImportError:
 TZ, GRACE = ZoneInfo("Asia/Kolkata"), 30  # minutes before an unconfirmed dose is marked missed
 DEFAULT_TIMES = ["08:00", "13:00", "18:00", "21:00", "10:00", "15:00"]  # only starting suggestions; all editable
 MAX_DOSES = 6
+REMIND_DEFAULT = 5   # minutes the robot keeps repeating a dose reminder (caregiver can change it: 1 .. GRACE)
+REPEAT_EVERY = 60    # seconds between repeated spoken reminders
 ALERT_AFTER = 15    # minutes after the dose time with no response -> alert on caregiver dashboard (must be < GRACE)
 DB_PATH = "medminder_accounts.db"
 LANGS = {"English": ("en", "en-IN"), "हिन्दी": ("hi", "hi-IN"), "தமிழ்": ("ta", "ta-IN"),
@@ -172,11 +178,23 @@ T["kn"] = dict(title="ಮೆಡ್\u200cಮೈಂಡರ್", sub="ನಿಮ್�
   disc="ಈ ಆ್ಯಪ್ ವೈದ್ಯರ ಸೂಚನೆಯಂತೆ ನಮೂದಿಸಿದ ವೇಳಾಪಟ್ಟಿಯನ್ನು ಮಾತ್ರ ಅನುಸರಿಸುತ್ತದೆ. ಇದು ಔಷಧಿಗಳನ್ನು ಸೂಚಿಸುವುದಿಲ್ಲ, ಡೋಸ್ ಬದಲಾಯಿಸುವುದಿಲ್ಲ.",
   dash_alert="ರೋಗಿಯಿಂದ ಪ್ರತಿಕ್ರಿಯೆ ಇಲ್ಲ", ack="ಸರಿ", min="ನಿಮಿಷ ತಡ")
 
+
+T["en"].update(theme="Colours", th_navy="Navy & Snow", th_lav="Lavender & Pink", th_peach="Peach & Beach", repeat="Say it again")
+T["hi"].update(theme="रंग", th_navy="नेवी ब्लू और स्नो व्हाइट", th_lav="लैवेंडर और गुलाबी", th_peach="पीच और बीच ब्लू", repeat="फिर से सुनें")
+T["ta"].update(theme="வண்ணங்கள்", th_navy="நேவி நீலம் & பனி வெள்ளை", th_lav="லாவெண்டர் & இளஞ்சிவப்பு", th_peach="பீச் & கடற்கரை நீலம்", repeat="மீண்டும் சொல்")
+T["te"].update(theme="రంగులు", th_navy="నేవీ బ్లూ & స్నో వైట్", th_lav="లావెండర్ & పింక్", th_peach="పీచ్ & బీచ్ బ్లూ", repeat="మళ్లీ చెప్పు")
+T["ml"].update(theme="നിറങ്ങൾ", th_navy="നേവി ബ്ലൂ & സ്നോ വൈറ്റ്", th_lav="ലാവെൻഡർ & പിങ്ക്", th_peach="പീച്ച് & ബീച്ച് ബ്ലൂ", repeat="വീണ്ടും പറയൂ")
+T["kn"].update(theme="ಬಣ್ಣಗಳು", th_navy="ನೇವಿ ಬ್ಲೂ & ಸ್ನೋ ವೈಟ್", th_lav="ಲ್ಯಾವೆಂಡರ್ & ಪಿಂಕ್", th_peach="ಪೀಚ್ & ಬೀಚ್ ಬ್ಲೂ", repeat="ಮತ್ತೆ ಹೇಳು")
+
+T["en"].update(rem_set="Robot reminder time (minutes)", rem_help="After each dose time, the robot keeps reminding the patient by voice for this many minutes, or until the dose is marked.", rem_left="min left")
+T["hi"].update(rem_set="रोबोट रिमाइंडर समय (मिनट)", rem_help="हर खुराक के समय के बाद रोबोट इतने मिनट तक, या खुराक दर्ज होने तक, मरीज़ को आवाज़ से याद दिलाता रहेगा।", rem_left="मिनट शेष")
+T["ta"].update(rem_set="ரோபோ நினைவூட்டல் நேரம் (நிமிடங்கள்)", rem_help="ஒவ்வொரு மருந்து நேரத்திற்குப் பிறகும் இத்தனை நிமிடங்கள், அல்லது அளவு குறிக்கப்படும் வரை, ரோபோ குரலில் நினைவூட்டிக்கொண்டே இருக்கும்.", rem_left="நிமிடம் மீதம்")
+T["te"].update(rem_set="రోబో రిమైండర్ సమయం (నిమిషాలు)", rem_help="ప్రతి మందు సమయం తర్వాత రోబో ఇన్ని నిమిషాల పాటు, లేదా మోతాదు నమోదు చేసేవరకు, రోగికి గొంతుతో గుర్తుచేస్తూ ఉంటుంది.", rem_left="నిమిషాలు మిగిలాయి")
+T["ml"].update(rem_set="റോബോട്ട് ഓർമ്മപ്പെടുത്തൽ സമയം (മിനിറ്റ്)", rem_help="ഓരോ മരുന്ന് സമയത്തിനു ശേഷവും ഇത്ര മിനിറ്റ്, അല്ലെങ്കിൽ ഡോസ് രേഖപ്പെടുത്തുന്നതുവരെ, റോബോട്ട് ശബ്ദത്തിൽ രോഗിയെ ഓർമ്മപ്പെടുത്തിക്കൊണ്ടിരിക്കും.", rem_left="മിനിറ്റ് ബാക്കി")
+T["kn"].update(rem_set="ರೋಬೋಟ್ ಜ್ಞಾಪನೆ ಸಮಯ (ನಿಮಿಷ)", rem_help="ಪ್ರತಿ ಔಷಧಿ ಸಮಯದ ನಂತರ ರೋಬೋಟ್ ಇಷ್ಟು ನಿಮಿಷ, ಅಥವಾ ಡೋಸ್ ದಾಖಲಿಸುವವರೆಗೆ, ಧ್ವನಿಯಲ್ಲಿ ರೋಗಿಗೆ ನೆನಪಿಸುತ್ತಲೇ ಇರುತ್ತದೆ.", rem_left="ನಿಮಿಷ ಬಾಕಿ")
+
 st.set_page_config(page_title="MedMinder", page_icon="💊", layout="centered")
-st.markdown("""<style>html,body,[class*="css"]{font-size:19px}
-.stButton>button{min-height:3rem;font-weight:600;border-radius:12px}
-.disc{border:2px dashed #4F6B72;border-radius:12px;padding:12px 16px;color:#4F6B72;margin-top:2rem}</style>""",
-            unsafe_allow_html=True)
+
 
 
 @st.cache_resource
@@ -195,6 +213,8 @@ def conn():
     """)
     if "cg_ack" not in [r[1] for r in c.execute("pragma table_info(dose_log)")]:
         c.execute("alter table dose_log add column cg_ack integer default 0")  # caregiver pressed "Got it"
+    if "remind_min" not in [r[1] for r in c.execute("pragma table_info(patients)")]:
+        c.execute(f"alter table patients add column remind_min integer default {REMIND_DEFAULT}")  # robot reminder minutes
     c.commit()
     return c
 
@@ -283,6 +303,11 @@ def check_patient(pid):
     db.commit()
 
 
+def get_remind_min(pid):
+    r = db.execute("select remind_min from patients where id=?", (pid,)).fetchone()
+    return int(r[0]) if r and r[0] else REMIND_DEFAULT
+
+
 def data(pid):
     check_patient(pid)
     today = now().date().isoformat()
@@ -317,9 +342,124 @@ def summary(t, doses, hist, appts):
         st.caption(t["none_a"])
 
 
+# ---------------- colour themes + robot ----------------
+THEMES = {  # bg/soft = page colours, tx = text, ac = main accent (buttons), ac2 = pastel accent, g1/g2 = title gradient
+    "navy":  dict(bg="#F7FAFF", soft="#E3ECFB", tx="#14213D", ac="#1F3A68", ac2="#9DB7E8", g1="#1F3A68", g2="#5B82C9", emoji="🌙"),
+    "lav":   dict(bg="#F8F3FF", soft="#FBE6F1", tx="#47356B", ac="#7E5BC7", ac2="#F6A5C8", g1="#7E5BC7", g2="#EE82B1", emoji="🌸"),
+    "peach": dict(bg="#FFF5EE", soft="#DDF1F7", tx="#33454F", ac="#1E7FA3", ac2="#FFB48E", g1="#1E7FA3", g2="#FF9A6B", emoji="🍑"),
+}
+
+THEME_CSS = """<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@500;700;800&display=swap');
+html,body,[class*="css"]{font-size:19px}
+.stApp{background:linear-gradient(180deg,@bg@ 0%,@soft@ 100%);color:@tx@;color-scheme:light}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp p,.stApp label,.stApp li,.stApp button,.stApp input,.stApp textarea,
+.stApp [data-baseweb="tab"]{font-family:'Nunito',sans-serif}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp p,.stApp label,.stApp li,.stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stCaptionContainer"],.stApp [data-testid="stWidgetLabel"] p{color:@tx@}
+.stApp h1{background:linear-gradient(90deg,@g1@,@g2@);-webkit-background-clip:text;background-clip:text;
+ -webkit-text-fill-color:transparent;font-weight:800}
+[data-testid="stSidebar"]{background:@soft@}
+.stApp .stButton>button,.stApp .stFormSubmitButton>button,.stApp [data-testid="stBaseButton-secondary"],
+.stApp [data-testid="stBaseButton-secondaryFormSubmit"]{background:@ac@;color:#fff;border:0;border-radius:999px;min-height:3rem;
+ font-weight:700;box-shadow:0 4px 0 rgba(0,0,0,.15);transition:transform .1s}
+.stApp .stButton>button:hover,.stApp .stFormSubmitButton>button:hover,.stApp [data-testid="stBaseButton-secondary"]:hover,
+.stApp [data-testid="stBaseButton-secondaryFormSubmit"]:hover{background:@g2@;color:#fff;transform:translateY(-1px)}
+.stApp .stButton>button:active,.stApp .stFormSubmitButton>button:active{transform:translateY(3px);box-shadow:none}
+.stApp .stButton>button p,.stApp .stFormSubmitButton>button p,.stApp [data-testid^="stBaseButton-secondary"] p{color:#fff!important}
+.stApp [data-baseweb="input"],.stApp [data-baseweb="select"]>div,.stApp [data-baseweb="textarea"]{background:#fff!important;
+ border:2px solid @ac2@!important;border-radius:14px!important}
+.stApp [data-baseweb="base-input"]{background:#fff!important}
+.stApp input,.stApp textarea,.stApp [data-baseweb="select"] div{color:@tx@!important;-webkit-text-fill-color:@tx@}
+[data-baseweb="popover"] ul,[data-baseweb="popover"] li{background:#fff!important;color:@tx@!important}
+.stApp .stTabs [data-baseweb="tab"]{font-weight:700;color:@tx@}
+.stApp .stTabs [aria-selected="true"]{color:@ac@}
+.stApp .stTabs [data-baseweb="tab-highlight"]{background:@ac@!important;height:4px;border-radius:4px}
+.stApp [data-testid="stVerticalBlockBorderWrapper"]{border-color:@ac2@!important;border-width:2px!important;border-radius:20px!important}
+.stApp [data-testid="stForm"]{border:2px solid @ac2@;border-radius:20px;background:rgba(255,255,255,.65)}
+.stApp [data-testid="stExpander"]{border:2px solid @ac2@;border-radius:16px;background:rgba(255,255,255,.55)}
+.stApp [data-testid="stMetricValue"]{color:@ac@;font-weight:800}
+.stApp [data-testid="stAlert"]{border-radius:16px}
+.disc{border:2px dashed @ac@;border-radius:16px;padding:12px 16px;color:@tx@;margin-top:2rem;background:rgba(255,255,255,.55)}
+.robot-row{display:flex;align-items:center;gap:4px;margin:6px 0 14px}
+.robot-row img{flex:none;filter:drop-shadow(0 6px 8px rgba(0,0,0,.12))}
+.bubble{position:relative;background:#fff;border:3px solid @ac2@;border-radius:22px;padding:12px 18px;font-weight:700;
+ color:@tx@;box-shadow:0 4px 0 @ac2@;line-height:1.35}
+.bubble:before{content:"";position:absolute;left:-13px;top:50%;margin-top:-10px;border:10px solid transparent;
+ border-left:0;border-right-color:@ac2@}
+.bubble div+div{margin-top:4px}
+</style>"""
+
+ROBOT_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 150" width="160" height="150">
+<style>
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes blink{0%,90%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}
+@keyframes talk{0%,100%{transform:scaleY(.3)}50%{transform:scaleY(1)}}
+@keyframes wave{0%,100%{transform:rotate(0deg)}50%{transform:rotate(-40deg)}}
+@keyframes ping{0%{opacity:0}35%{opacity:1}70%,100%{opacity:0}}
+@keyframes glow{0%,100%{transform:scale(1)}50%{transform:scale(1.35)}}
+.bob{animation:bob 1.8s ease-in-out infinite}
+.eye{transform-box:fill-box;transform-origin:center;animation:blink 4s infinite}
+.mouth{transform-box:fill-box;transform-origin:center;animation:talk .5s ease-in-out infinite}
+.arm{transform-origin:98px 114px;animation:wave 1s ease-in-out infinite}
+.bulb{transform-box:fill-box;transform-origin:center;animation:glow 1s ease-in-out infinite}
+.w1{animation:ping 1.2s infinite}.w2{animation:ping 1.2s .2s infinite}.w3{animation:ping 1.2s .4s infinite}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+<ellipse cx="70" cy="146" rx="30" ry="3.5" fill="#000" opacity=".1"/>
+<g class="bob">
+<line x1="70" y1="30" x2="70" y2="17" stroke="@ac@" stroke-width="5" stroke-linecap="round"/>
+<circle class="bulb" cx="70" cy="12" r="7" fill="@ac2@" stroke="@ac@" stroke-width="3"/>
+<rect x="16" y="52" width="12" height="26" rx="6" fill="@ac@"/>
+<rect x="112" y="52" width="12" height="26" rx="6" fill="@ac@"/>
+<rect x="24" y="30" width="92" height="72" rx="28" fill="#fff" stroke="@ac@" stroke-width="5"/>
+<rect x="35" y="41" width="70" height="50" rx="20" fill="@ac@"/>
+<g class="eye"><circle cx="54" cy="60" r="7" fill="#fff"/></g>
+<g class="eye"><circle cx="86" cy="60" r="7" fill="#fff"/></g>
+<ellipse cx="47" cy="75" rx="6" ry="3.5" fill="@ac2@"/><ellipse cx="93" cy="75" rx="6" ry="3.5" fill="@ac2@"/>
+<rect class="mouth" x="62" y="72" width="16" height="10" rx="5" fill="#fff"/>
+<rect x="42" y="106" width="56" height="34" rx="14" fill="@ac2@" stroke="@ac@" stroke-width="4"/>
+<path d="M70 132 l-8 -8 a4.5 4.5 0 0 1 8 -5.5 a4.5 4.5 0 0 1 8 5.5 z" fill="#fff"/>
+<line x1="44" y1="114" x2="26" y2="126" stroke="@ac@" stroke-width="7" stroke-linecap="round"/>
+<g class="arm"><line x1="98" y1="114" x2="118" y2="100" stroke="@ac@" stroke-width="7" stroke-linecap="round"/>
+<circle cx="119" cy="99" r="5" fill="@ac2@" stroke="@ac@" stroke-width="2"/></g>
+<g fill="none" stroke="@g2@" stroke-width="4" stroke-linecap="round">
+<path class="w1" d="M128 56 q6 7 0 14"/><path class="w2" d="M134 50 q9 13 0 26"/><path class="w3" d="M140 44 q12 19 0 38"/></g>
+</g>
+</svg>"""
+
+
+def tokens(text, c):
+    for k, v in c.items():
+        text = text.replace(f"@{k}@", v)
+    return text
+
+
+def apply_theme(key):
+    st.markdown(tokens(THEME_CSS, THEMES[key]), unsafe_allow_html=True)
+
+
+def robot(lines):
+    """Cute talking robot with a speech bubble (shown while a spoken reminder is active)."""
+    img = base64.b64encode(tokens(ROBOT_SVG, THEMES[st.session_state.get("theme", "lav")]).encode()).decode()
+    bubble = "".join(f"<div>{esc(x)}</div>" for x in lines)
+    st.markdown(f"<div class='robot-row'><img src='data:image/svg+xml;base64,{img}' width='130' alt='robot'>"
+                f"<div class='bubble'>{bubble}</div></div>", unsafe_allow_html=True)
+
+
+def reset_session():
+    """Sign out / clear the session but remember the chosen language and colours."""
+    prefs = st.session_state.get("_prefs")
+    st.session_state.clear()
+    if prefs:
+        st.session_state["_prefs"] = prefs
+    st.rerun()
+
+
 def speak(texts, voice, title):
     """Spoken + browser-notification alert (runs in the browser)."""
     components.html(f"""<script>
+    // {dt.datetime.now().isoformat()}
     const L={json.dumps(voice)},T={json.dumps(texts)},H={json.dumps(title)};
     try{{if('Notification' in window&&Notification.permission==='default')Notification.requestPermission()}}catch(e){{}}
     T.forEach(s=>{{try{{const u=new SpeechSynthesisUtterance(s);u.lang=L;u.rate=.9;speechSynthesis.speak(u)}}catch(e){{}}
@@ -331,16 +471,23 @@ def disclaimer(t):
 
 
 # ---------------- sidebar: language ----------------
+_prefs = st.session_state.get("_prefs", {})
+st.session_state.setdefault("lang", _prefs.get("lang", "English"))
+st.session_state.setdefault("theme", _prefs.get("theme", "lav"))
 lang_name = st.sidebar.selectbox("🌐", list(LANGS), key="lang")
 code, voice = LANGS[lang_name]
 t = T[code]
+theme_key = st.sidebar.selectbox("🎨 " + t["theme"], list(THEMES), key="theme",
+                                 format_func=lambda k: f"{THEMES[k]['emoji']} {t['th_' + k]}")
+st.session_state["_prefs"] = {"lang": lang_name, "theme": theme_key}
+apply_theme(theme_key)
 st.title(f"💊 {t['title']}")
 st.caption(t["sub"])
 
 # ---------------- sign in / create account ----------------
 if "pid" in st.session_state and not db.execute(
         "select 1 from patients where id=?", (st.session_state["pid"],)).fetchone():
-    st.session_state.clear(); st.rerun()
+    reset_session()
 
 if "pid" not in st.session_state:
     tab_in, tab_new = st.tabs([t["signin"], t["create"]])
@@ -385,7 +532,7 @@ pid, role, pname = st.session_state["pid"], st.session_state["role"], st.session
 st.sidebar.write(f"{t['signed']} **{pname}**")
 st.sidebar.caption(t["caregiver"] if role == "caregiver" else t["patient"])
 if st.sidebar.button(t["signout"], use_container_width=True):
-    st.session_state.clear(); st.rerun()
+    reset_session()
 if st_autorefresh:
     st_autorefresh(interval=30000, key="tick")
 
@@ -409,6 +556,10 @@ if role == "caregiver":
     # ---- live alerts: doses the patient has not answered ----
     spoken = st.session_state.setdefault("spoken", set())
     new_alerts = []
+    _alerts = [d for d in doses if (d["status"] == "pending" or (d["status"] == "missed" and d["auto"])) and not d["cg_ack"]
+               and int((now() - dt.datetime.fromisoformat(f"{d['day']}T{d['time']}")).total_seconds() // 60) >= ALERT_AFTER]
+    if _alerts:
+        robot([f"{pname}: {t['dash_alert']} - {d['name']}" for d in _alerts[:3]])
     for d in doses:
         late = int((now() - dt.datetime.fromisoformat(f"{d['day']}T{d['time']}")).total_seconds() // 60)
         no_reply = d["status"] == "pending" or (d["status"] == "missed" and d["auto"])
@@ -438,6 +589,13 @@ if role == "caregiver":
         summary(t, doses, hist, appts)
 
     with tab_meds:
+        st.subheader("🤖 " + t["rem_set"])
+        with st.form("remform"):
+            rm = st.number_input(t["rem_set"], 1, GRACE, get_remind_min(pid))
+            st.caption(t["rem_help"])
+            if st.form_submit_button(t["save"], use_container_width=True):
+                db.execute("update patients set remind_min=? where id=?", (int(rm), pid)); db.commit()
+                st.success(t["updated"])
         st.subheader(t["add_med"])
         n_doses = st.number_input(t["how_many"], 1, MAX_DOSES, 1, key="n_doses")  # outside the form so inputs update
         with st.form("med", clear_on_submit=True):
@@ -528,11 +686,28 @@ hhmm = now().strftime("%H:%M")
 
 with tab_today:
     spoken = st.session_state.setdefault("spoken", set())
+    last_said = st.session_state.setdefault("last_said", {})
+    rmin, n_ = get_remind_min(pid), now()
+    age = lambda d: (n_ - dt.datetime.fromisoformat(f"{d['day']}T{d['time']}")).total_seconds()
+    line = lambda d: f"{t['remind']} {d['name']} ({food_label(t, d['food'])})"
     due = [d for d in doses if d["status"] == "pending" and d["time"] <= hhmm]
     fresh = [d for d in due if d["id"] not in spoken]
-    if fresh:
-        speak([f"{t['remind']} {d['name']} ({food_label(t, d['food'])})" for d in fresh], voice, t["due"])
+    # keep repeating the reminder (about once a minute) for as long as the caregiver set, until the dose is marked
+    again = [d for d in due if d["id"] in spoken and age(d) < rmin * 60
+             and (n_ - last_said.get(d["id"], dt.datetime.min)).total_seconds() >= REPEAT_EVERY - 5]
+    say = fresh + again
+    if say:
+        speak([line(d) for d in say], voice, t["due"])
         spoken.update(d["id"] for d in fresh)
+        last_said.update({d["id"]: n_ for d in say})
+    said = {d["id"] for d in say}
+    live = [d for d in due if age(d) < rmin * 60 or d["id"] in said]
+    if live:
+        left = max(0, -(-int(rmin * 60 - min(age(d) for d in live)) // 60))   # whole minutes left, rounded up
+        robot([line(d) for d in live[:3]] + ([f"+{len(live) - 3}"] if len(live) > 3 else [])
+              + ([f"⏳ {left} {t['rem_left']}"] if left else []))
+        if st.button("🔊 " + t["repeat"], key="repeat_voice"):
+            spoken.clear(); st.rerun()
     for d in due:
         st.warning(f"⏰ {t['due']}: **{d['name']}** · {fmt12(d['time'])}")
     if not doses:
