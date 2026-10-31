@@ -4,14 +4,11 @@ Accounts: a patient signs in with name + phone number / email. A caregiver signs
 details plus the 4-digit caregiver PIN. Every record belongs to one patient, so nobody sees another
 patient's medicines. Only the caregiver adds / removes medicines and chooses their times.
 
-If "Keep me signed in" is ticked, the browser keeps a random login token for 30 days, so the patient / caregiver
-does not have to sign in every time (needs Streamlit 1.37+). Signing out or changing the PIN ends it.
-
 Times are chosen and shown in 12-hour AM/PM format. If the patient has not confirmed a dose (taken / missed)
 within ALERT_AFTER minutes, a red alert appears at the top of the caregiver dashboard until the caregiver
 presses "Got it" (or the patient confirms the dose).
 """
-import hashlib, hmac, json, os, re, secrets, sqlite3
+import hashlib, hmac, json, os, re, sqlite3
 import datetime as dt
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -28,9 +25,8 @@ DEFAULT_TIMES = ["08:00", "13:00", "18:00", "21:00", "10:00", "15:00"]  # only s
 MAX_DOSES = 6
 ALERT_AFTER = 15    # minutes after the dose time with no response -> alert on caregiver dashboard (must be < GRACE)
 DB_PATH = "medminder_accounts.db"
-SESSION_DAYS = 30   # "Keep me signed in" lasts this many days on that browser
-COOKIE = "mm_token"
-LANGS = {"English": ("en", "en-IN"), "हिन्दी": ("hi", "hi-IN"), "தமிழ்": ("ta", "ta-IN")}
+LANGS = {"English": ("en", "en-IN"), "हिन्दी": ("hi", "hi-IN"), "தமிழ்": ("ta", "ta-IN"),
+         "తెలుగు": ("te", "te-IN"), "മലയാളം": ("ml", "ml-IN"), "ಕನ್ನಡ": ("kn", "kn-IN")}
 
 T = {
  "en": dict(title="MedMinder", sub="Your medicines, on time", today="Today", meds="Medicines", appts="Appointments",
@@ -41,7 +37,7 @@ T = {
   pin="Caregiver PIN (4 digits)", history="Last 7 days", attention="Needs attention", due="Time for your medicine",
   none_m="No doses today.", none_a="No upcoming appointments.", done="doses taken", nomiss="Nothing missed today.",
   remind="Time to take", voice="Alerts refresh every 30 seconds while this page is open.",
-  keep="Keep me signed in for 30 days", signin="Sign in", create="Create account", pname="Patient name", contact="Phone number or email",
+  signin="Sign in", create="Create account", pname="Patient name", contact="Phone number or email",
   signin_as="Sign in as", invalid="Details do not match. Please check and try again.",
   bad_contact="Enter a valid 10-digit phone number or an email address.",
   exists="An account with this phone/email already exists. Please sign in.", need_name="Please enter the patient name.",
@@ -60,7 +56,7 @@ T = {
   attention="ध्यान देने योग्य", due="दवा का समय हो गया", none_m="आज कोई खुराक नहीं।",
   none_a="कोई आने वाला अपॉइंटमेंट नहीं।", done="खुराक ली गईं", nomiss="आज कोई खुराक नहीं छूटी।",
   remind="दवा लेने का समय:", voice="यह पेज खुला रहने पर अलर्ट हर 30 सेकंड में अपडेट होते हैं।",
-  keep="30 दिन तक साइन इन रखें", signin="साइन इन", create="खाता बनाएँ", pname="मरीज़ का नाम", contact="फ़ोन नंबर या ईमेल",
+  signin="साइन इन", create="खाता बनाएँ", pname="मरीज़ का नाम", contact="फ़ोन नंबर या ईमेल",
   signin_as="इस रूप में साइन इन करें", invalid="विवरण मेल नहीं खाते। कृपया जाँचकर फिर कोशिश करें।",
   bad_contact="सही 10 अंकों का फ़ोन नंबर या ईमेल दर्ज करें।",
   exists="इस फ़ोन/ईमेल से खाता पहले से है। कृपया साइन इन करें।", need_name="कृपया मरीज़ का नाम लिखें।",
@@ -81,7 +77,7 @@ T = {
   none_m="இன்று அளவுகள் இல்லை.", none_a="வரவிருக்கும் சந்திப்புகள் இல்லை.", done="அளவுகள் எடுக்கப்பட்டன",
   nomiss="இன்று எதுவும் தவறவில்லை.", remind="மருந்து எடுக்கும் நேரம்:",
   voice="இந்தப் பக்கம் திறந்திருக்கும் வரை அறிவிப்புகள் 30 விநாடிகளுக்கு ஒருமுறை புதுப்பிக்கப்படும்.",
-  keep="30 நாட்களுக்கு உள்நுழைந்தே வைத்திரு", signin="உள்நுழை", create="கணக்கை உருவாக்கு", pname="நோயாளியின் பெயர்", contact="தொலைபேசி எண் அல்லது மின்னஞ்சல்",
+  signin="உள்நுழை", create="கணக்கை உருவாக்கு", pname="நோயாளியின் பெயர்", contact="தொலைபேசி எண் அல்லது மின்னஞ்சல்",
   signin_as="இவராக உள்நுழை", invalid="விவரங்கள் பொருந்தவில்லை. சரிபார்த்து மீண்டும் முயற்சிக்கவும்.",
   bad_contact="சரியான 10 இலக்க தொலைபேசி எண் அல்லது மின்னஞ்சலை உள்ளிடவும்.",
   exists="இந்த தொலைபேசி/மின்னஞ்சலில் ஏற்கனவே கணக்கு உள்ளது. உள்நுழையவும்.", need_name="நோயாளியின் பெயரை உள்ளிடவும்.",
@@ -99,6 +95,82 @@ T = {
 T["en"].update(dash_alert="No response from patient", ack="Got it", min="min late")
 T["hi"].update(dash_alert="मरीज़ की ओर से कोई जवाब नहीं", ack="ठीक है", min="मिनट देर")
 T["ta"].update(dash_alert="நோயாளியிடமிருந்து பதில் இல்லை", ack="சரி", min="நிமிடம் தாமதம்")
+
+T["te"] = dict(title="మెడ్\u200cమైండర్", sub="మీ మందులు, సరైన సమయానికి", today="ఈరోజు", meds="మందులు",
+  appts="అపాయింట్\u200cమెంట్లు", patient="రోగి", caregiver="సంరక్షకులు", taken="తీసుకున్నాను",
+  missed="తప్పిపోయింది", pending="మిగిలి ఉంది", add_med="మందును జోడించండి", name="మందు పేరు",
+  dose="మోతాదు (డాక్టర్ చెప్పినట్లు)", food="ఆహారం", before="భోజనానికి ముందు", after="భోజనం తర్వాత",
+  anytime="ఎప్పుడైనా", times="సమయాలు", time="సమయం", save="సేవ్ చేయండి", add="జోడించండి", delete="తొలగించండి",
+  doctor="డాక్టర్", date="తేదీ", note="గమనిక", pin="సంరక్షకుల పిన్ (4 అంకెలు)", history="గత 7 రోజులు",
+  attention="శ్రద్ధ అవసరం", due="మందు వేసుకునే సమయం అయింది", none_m="ఈరోజు మోతాదులు లేవు.",
+  none_a="రాబోయే అపాయింట్\u200cమెంట్లు లేవు.", done="మోతాదులు తీసుకున్నారు", nomiss="ఈరోజు ఏదీ తప్పిపోలేదు.",
+  remind="మందు వేసుకునే సమయం:",
+  voice="ఈ పేజీ తెరిచి ఉన్నంతసేపు హెచ్చరికలు ప్రతి 30 సెకన్లకు నవీకరించబడతాయి.",
+  signin="సైన్ ఇన్", create="ఖాతా సృష్టించండి", pname="రోగి పేరు", contact="ఫోన్ నంబర్ లేదా ఇమెయిల్",
+  signin_as="ఇలా సైన్ ఇన్ చేయండి", invalid="వివరాలు సరిపోలలేదు. దయచేసి సరిచూసి మళ్లీ ప్రయత్నించండి.",
+  bad_contact="సరైన 10 అంకెల ఫోన్ నంబర్ లేదా ఇమెయిల్ నమోదు చేయండి.",
+  exists="ఈ ఫోన్ నంబర్ లేదా ఇమెయిల్ ఉన్న ఖాతా ఇప్పటికే ఉంది. దయచేసి సైన్ ఇన్ చేయండి.",
+  need_name="దయచేసి రోగి పేరు నమోదు చేయండి.", bad_pin="పిన్ సరిగ్గా 4 అంకెలు ఉండాలి.",
+  signout="సైన్ అవుట్", signed="సైన్ ఇన్ అయినవారు:", cg_for="సంరక్షకుల వీక్షణ:",
+  how_many="రోజుకు ఎన్ని మోతాదులు", edit_times="సమయాలను మార్చండి", keep_times="ఉంచాల్సిన సమయాలు",
+  add_time="మరొక సమయం జోడించండి", need_time="కనీసం ఒక సమయం ఉంచండి.", updated="నవీకరించబడింది",
+  confirm="ఈ మందును, దాని మోతాదు చరిత్రను తొలగించాలా?", yes="అవును, తొలగించు", cancel="రద్దు చేయి",
+  none_med="ఇంకా మందులు జోడించలేదు.", need_med="దయచేసి మందు పేరు నమోదు చేయండి.",
+  ro_note="మీ సంరక్షకులు మందులను జోడించి, సమయాలను నిర్ణయిస్తారు.", new_pin="కొత్త సంరక్షకుల పిన్",
+  change_pin="పిన్ మార్చండి", pin_saved="పిన్ నవీకరించబడింది", overview="సారాంశం", account="ఖాతా",
+  disc="ఈ యాప్ మీ డాక్టర్ సూచనల ప్రకారం నమోదు చేసిన షెడ్యూల్ను మాత్రమే అనుసరిస్తుంది. ఇది మందులను సూచించదు, మోతాదులను మార్చదు.",
+  dash_alert="రోగి నుండి స్పందన లేదు", ack="సరే", min="నిమిషాలు ఆలస్యం")
+
+T["ml"] = dict(title="മെഡ്\u200cമൈൻഡർ", sub="നിങ്ങളുടെ മരുന്നുകൾ, കൃത്യസമയത്ത്", today="ഇന്ന്", meds="മരുന്നുകൾ",
+  appts="അപ്പോയിന്റ്മെന്റുകൾ", patient="രോഗി", caregiver="പരിചരിക്കുന്നയാൾ", taken="കഴിച്ചു",
+  missed="വിട്ടുപോയി", pending="ബാക്കി", add_med="മരുന്ന് ചേർക്കുക", name="മരുന്നിന്റെ പേര്",
+  dose="അളവ് (ഡോക്ടർ പറഞ്ഞതുപോലെ)", food="ഭക്ഷണം", before="ഭക്ഷണത്തിന് മുമ്പ്", after="ഭക്ഷണത്തിന് ശേഷം",
+  anytime="എപ്പോൾ വേണമെങ്കിലും", times="സമയങ്ങൾ", time="സമയം", save="സേവ് ചെയ്യുക", add="ചേർക്കുക",
+  delete="നീക്കം ചെയ്യുക", doctor="ഡോക്ടർ", date="തീയതി", note="കുറിപ്പ്",
+  pin="പരിചരിക്കുന്നയാളുടെ പിൻ (4 അക്കം)", history="കഴിഞ്ഞ 7 ദിവസം", attention="ശ്രദ്ധിക്കേണ്ടവ",
+  due="മരുന്ന് കഴിക്കേണ്ട സമയം", none_m="ഇന്ന് ഡോസുകൾ ഇല്ല.", none_a="വരാനിരിക്കുന്ന അപ്പോയിന്റ്മെന്റുകൾ ഇല്ല.",
+  done="ഡോസുകൾ കഴിച്ചു", nomiss="ഇന്ന് ഒന്നും വിട്ടുപോയില്ല.", remind="മരുന്ന് കഴിക്കേണ്ട സമയം:",
+  voice="ഈ പേജ് തുറന്നിരിക്കുമ്പോൾ ഓരോ 30 സെക്കൻഡിലും അറിയിപ്പുകൾ പുതുക്കും.",
+  signin="സൈൻ ഇൻ", create="അക്കൗണ്ട് ഉണ്ടാക്കുക", pname="രോഗിയുടെ പേര്", contact="ഫോൺ നമ്പർ അല്ലെങ്കിൽ ഇമെയിൽ",
+  signin_as="ഇങ്ങനെ സൈൻ ഇൻ ചെയ്യുക", invalid="വിവരങ്ങൾ യോജിക്കുന്നില്ല. പരിശോധിച്ച് വീണ്ടും ശ്രമിക്കുക.",
+  bad_contact="ശരിയായ 10 അക്ക ഫോൺ നമ്പറോ ഇമെയിലോ നൽകുക.",
+  exists="ഈ ഫോൺ/ഇമെയിൽ ഉപയോഗിച്ച് അക്കൗണ്ട് ഇതിനകം ഉണ്ട്. സൈൻ ഇൻ ചെയ്യുക.", need_name="രോഗിയുടെ പേര് നൽകുക.",
+  bad_pin="പിൻ കൃത്യം 4 അക്കങ്ങൾ ആയിരിക്കണം.", signout="സൈൻ ഔട്ട്", signed="സൈൻ ഇൻ ചെയ്തത്:",
+  cg_for="പരിചരിക്കുന്നയാളുടെ കാഴ്ച:", how_many="ദിവസം എത്ര ഡോസ്", edit_times="സമയങ്ങൾ മാറ്റുക",
+  keep_times="നിലനിർത്തേണ്ട സമയങ്ങൾ", add_time="മറ്റൊരു സമയം ചേർക്കുക", need_time="കുറഞ്ഞത് ഒരു സമയം വേണം.",
+  updated="പുതുക്കി", confirm="ഈ മരുന്നും അതിന്റെ ഡോസ് ചരിത്രവും നീക്കം ചെയ്യണോ?",
+  yes="അതെ, നീക്കം ചെയ്യുക", cancel="റദ്ദാക്കുക", none_med="മരുന്നുകൾ ഇതുവരെ ചേർത്തിട്ടില്ല.",
+  need_med="മരുന്നിന്റെ പേര് നൽകുക.",
+  ro_note="നിങ്ങളെ പരിചരിക്കുന്നയാൾ മരുന്നുകൾ ചേർക്കുകയും സമയം നിശ്ചയിക്കുകയും ചെയ്യും.",
+  new_pin="പരിചരിക്കുന്നയാളുടെ പുതിയ പിൻ", change_pin="പിൻ മാറ്റുക", pin_saved="പിൻ പുതുക്കി",
+  overview="സംഗ്രഹം", account="അക്കൗണ്ട്",
+  disc="ഡോക്ടറുടെ നിർദ്ദേശപ്രകാരം നൽകിയ ഷെഡ്യൂൾ മാത്രമേ ഈ ആപ്പ് പിന്തുടരൂ. ഇത് മരുന്നുകൾ നിർദ്ദേശിക്കുകയോ ഡോസ് മാറ്റുകയോ ചെയ്യില്ല.",
+  dash_alert="രോഗിയിൽ നിന്ന് പ്രതികരണമില്ല", ack="ശരി", min="മിനിറ്റ് വൈകി")
+
+T["kn"] = dict(title="ಮೆಡ್\u200cಮೈಂಡರ್", sub="ನಿಮ್ಮ ಔಷಧಿಗಳು, ಸರಿಯಾದ ಸಮಯಕ್ಕೆ", today="ಇಂದು", meds="ಔಷಧಿಗಳು",
+  appts="ವೈದ್ಯರ ಭೇಟಿಗಳು", patient="ರೋಗಿ", caregiver="ಆರೈಕೆದಾರರು", taken="ತೆಗೆದುಕೊಂಡೆ",
+  missed="ತಪ್ಪಿಹೋಯಿತು", pending="ಬಾಕಿ", add_med="ಔಷಧಿ ಸೇರಿಸಿ", name="ಔಷಧಿಯ ಹೆಸರು",
+  dose="ಪ್ರಮಾಣ (ವೈದ್ಯರು ಹೇಳಿದಂತೆ)", food="ಆಹಾರ", before="ಊಟಕ್ಕೆ ಮೊದಲು", after="ಊಟದ ನಂತರ",
+  anytime="ಯಾವಾಗ ಬೇಕಾದರೂ", times="ಸಮಯಗಳು", time="ಸಮಯ", save="ಉಳಿಸಿ", add="ಸೇರಿಸಿ", delete="ತೆಗೆದುಹಾಕಿ",
+  doctor="ವೈದ್ಯರು", date="ದಿನಾಂಕ", note="ಟಿಪ್ಪಣಿ", pin="ಆರೈಕೆದಾರರ ಪಿನ್ (4 ಅಂಕೆ)", history="ಕಳೆದ 7 ದಿನಗಳು",
+  attention="ಗಮನ ಬೇಕಾದವು", due="ಔಷಧಿ ತೆಗೆದುಕೊಳ್ಳುವ ಸಮಯ", none_m="ಇಂದು ಯಾವುದೇ ಡೋಸ್ ಇಲ್ಲ.",
+  none_a="ಮುಂಬರುವ ಭೇಟಿಗಳಿಲ್ಲ.", done="ಡೋಸ್ ತೆಗೆದುಕೊಳ್ಳಲಾಗಿದೆ", nomiss="ಇಂದು ಯಾವುದೂ ತಪ್ಪಿಲ್ಲ.",
+  remind="ಔಷಧಿ ತೆಗೆದುಕೊಳ್ಳುವ ಸಮಯ:",
+  voice="ಈ ಪುಟ ತೆರೆದಿರುವವರೆಗೆ ಎಚ್ಚರಿಕೆಗಳು ಪ್ರತಿ 30 ಸೆಕೆಂಡಿಗೆ ನವೀಕರಣಗೊಳ್ಳುತ್ತವೆ.",
+  signin="ಸೈನ್ ಇನ್", create="ಖಾತೆ ರಚಿಸಿ", pname="ರೋಗಿಯ ಹೆಸರು", contact="ಫೋನ್ ಸಂಖ್ಯೆ ಅಥವಾ ಇಮೇಲ್",
+  signin_as="ಹೀಗೆ ಸೈನ್ ಇನ್ ಮಾಡಿ", invalid="ವಿವರಗಳು ಹೊಂದಿಕೆಯಾಗುತ್ತಿಲ್ಲ. ಪರಿಶೀಲಿಸಿ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.",
+  bad_contact="ಸರಿಯಾದ 10 ಅಂಕೆಯ ಫೋನ್ ಸಂಖ್ಯೆ ಅಥವಾ ಇಮೇಲ್ ನಮೂದಿಸಿ.",
+  exists="ಈ ಫೋನ್ ಅಥವಾ ಇಮೇಲ್ ಹೊಂದಿರುವ ಖಾತೆ ಈಗಾಗಲೇ ಇದೆ. ದಯವಿಟ್ಟು ಸೈನ್ ಇನ್ ಮಾಡಿ.",
+  need_name="ದಯವಿಟ್ಟು ರೋಗಿಯ ಹೆಸರು ನಮೂದಿಸಿ.", bad_pin="ಪಿನ್ ಸರಿಯಾಗಿ 4 ಅಂಕೆಗಳಿರಬೇಕು.",
+  signout="ಸೈನ್ ಔಟ್", signed="ಸೈನ್ ಇನ್ ಆದವರು:", cg_for="ಆರೈಕೆದಾರರ ನೋಟ:",
+  how_many="ದಿನಕ್ಕೆ ಎಷ್ಟು ಡೋಸ್", edit_times="ಸಮಯ ಬದಲಿಸಿ", keep_times="ಉಳಿಸಬೇಕಾದ ಸಮಯಗಳು",
+  add_time="ಇನ್ನೊಂದು ಸಮಯ ಸೇರಿಸಿ", need_time="ಕನಿಷ್ಠ ಒಂದು ಸಮಯ ಇರಬೇಕು.", updated="ನವೀಕರಿಸಲಾಗಿದೆ",
+  confirm="ಈ ಔಷಧಿ ಮತ್ತು ಅದರ ಡೋಸ್ ಇತಿಹಾಸವನ್ನು ತೆಗೆದುಹಾಕಬೇಕೇ?", yes="ಹೌದು, ತೆಗೆದುಹಾಕಿ", cancel="ರದ್ದುಮಾಡಿ",
+  none_med="ಇನ್ನೂ ಔಷಧಿಗಳನ್ನು ಸೇರಿಸಿಲ್ಲ.", need_med="ದಯವಿಟ್ಟು ಔಷಧಿಯ ಹೆಸರು ನಮೂದಿಸಿ.",
+  ro_note="ನಿಮ್ಮ ಆರೈಕೆದಾರರು ಔಷಧಿಗಳನ್ನು ಸೇರಿಸಿ ಸಮಯ ನಿಗದಿಪಡಿಸುತ್ತಾರೆ.", new_pin="ಹೊಸ ಆರೈಕೆದಾರರ ಪಿನ್",
+  change_pin="ಪಿನ್ ಬದಲಿಸಿ", pin_saved="ಪಿನ್ ನವೀಕರಿಸಲಾಗಿದೆ", overview="ಸಾರಾಂಶ", account="ಖಾತೆ",
+  disc="ಈ ಆ್ಯಪ್ ವೈದ್ಯರ ಸೂಚನೆಯಂತೆ ನಮೂದಿಸಿದ ವೇಳಾಪಟ್ಟಿಯನ್ನು ಮಾತ್ರ ಅನುಸರಿಸುತ್ತದೆ. ಇದು ಔಷಧಿಗಳನ್ನು ಸೂಚಿಸುವುದಿಲ್ಲ, ಡೋಸ್ ಬದಲಾಯಿಸುವುದಿಲ್ಲ.",
+  dash_alert="ರೋಗಿಯಿಂದ ಪ್ರತಿಕ್ರಿಯೆ ಇಲ್ಲ", ack="ಸರಿ", min="ನಿಮಿಷ ತಡ")
 
 st.set_page_config(page_title="MedMinder", page_icon="💊", layout="centered")
 st.markdown("""<style>html,body,[class*="css"]{font-size:19px}
@@ -118,7 +190,6 @@ def conn():
         times text, created text, created_time text);
     create table if not exists dose_log(id integer primary key, med_id integer, patient_id integer, day text, time text,
         status text default 'pending', auto integer default 0, unique(med_id,day,time));
-    create table if not exists sessions(token_hash text primary key, patient_id integer, role text, expires text);
     create table if not exists appointments(id integer primary key, patient_id integer, doctor text, day text,
         time text, note text);
     """)
@@ -165,61 +236,8 @@ def find_patient(name, contact):
     return r if r and r["name"].casefold() == norm_name(name).casefold() else None
 
 
-def _h(tok):
-    return hashlib.sha256(tok.encode()).hexdigest()   # only the hash of the token is stored in the database
-
-
-def new_session(pid, role):
-    """Create a 'keep me signed in' token for this browser (valid SESSION_DAYS days)."""
-    tok = secrets.token_urlsafe(32)
-    db.execute("delete from sessions where expires < ?", (now().isoformat(),))
-    db.execute("insert into sessions(token_hash,patient_id,role,expires) values(?,?,?,?)",
-               (_h(tok), pid, role, (now() + dt.timedelta(days=SESSION_DAYS)).isoformat()))
-    db.commit()
-    return tok
-
-
-def browser_token():
-    try:
-        return st.context.cookies.get(COOKIE)   # needs Streamlit 1.37+
-    except Exception:
-        return None
-
-
-def restore_session():
-    """Sign in automatically if this browser holds a valid, unexpired token."""
-    tok = browser_token()
-    if not tok:
-        return
-    r = db.execute("select * from sessions where token_hash=?", (_h(tok),)).fetchone()
-    if not r or r["expires"] < now().isoformat():
-        return
-    p = db.execute("select * from patients where id=?", (r["patient_id"],)).fetchone()
-    if p:
-        st.session_state.update(pid=p["id"], pname=p["name"], contact=p["contact"], role=r["role"],
-                                spoken=set(), _tok=tok)
-
-
-def end_session():
-    for tok in {st.session_state.get("_tok"), browser_token()} - {None}:
-        db.execute("delete from sessions where token_hash=?", (_h(tok),))
-    db.commit()
-
-
-def cookie_js(value):
-    """Set (or, with value='', delete) the login cookie in the browser."""
-    age = SESSION_DAYS * 86400 if value else 0
-    components.html(f"""<script>
-    const p = window.parent, s = p.location.protocol === 'https:' ? ';Secure' : '';
-    p.document.cookie = '{COOKIE}={value};max-age={age};path=/;SameSite=Lax' + s;
-    </script>""", height=0)
-
-
-def login(row, role, remember=False):
+def login(row, role):
     st.session_state.update(pid=row["id"], pname=row["name"], contact=row["contact"], role=role, spoken=set())
-    if remember:
-        tok = new_session(row["id"], role)
-        st.session_state.update(_tok=tok, _set_cookie=tok)
     st.rerun()
 
 
@@ -320,8 +338,6 @@ st.title(f"💊 {t['title']}")
 st.caption(t["sub"])
 
 # ---------------- sign in / create account ----------------
-if "pid" not in st.session_state:
-    restore_session()   # "keep me signed in" cookie -> skip the sign-in screen
 if "pid" in st.session_state and not db.execute(
         "select 1 from patients where id=?", (st.session_state["pid"],)).fetchone():
     st.session_state.clear(); st.rerun()
@@ -334,12 +350,11 @@ if "pid" not in st.session_state:
             n_in = st.text_input(t["pname"])
             c_in = st.text_input(t["contact"])
             p_in = st.text_input(t["pin"], type="password", max_chars=4) if role_label == t["caregiver"] else ""
-            keep_in = st.checkbox(t["keep"], value=True)
             if st.form_submit_button(t["signin"], use_container_width=True):
                 row = find_patient(n_in, c_in)
                 is_cg = role_label == t["caregiver"]
                 if row and (not is_cg or (p_in and check_pin(p_in, row["pin_hash"]))):
-                    login(row, "caregiver" if is_cg else "patient", keep_in)
+                    login(row, "caregiver" if is_cg else "patient")
                 else:
                     st.error(t["invalid"])
     with tab_new:
@@ -362,8 +377,6 @@ if "pid" not in st.session_state:
                                      (norm_name(n_new), c_norm, hash_pin(p_new)))
                     db.commit()
                     login(db.execute("select * from patients where id=?", (cur.lastrowid,)).fetchone(), "patient")
-    if st.session_state.pop("_clear_cookie", False):
-        cookie_js("")
     disclaimer(t)
     st.stop()
 
@@ -372,10 +385,7 @@ pid, role, pname = st.session_state["pid"], st.session_state["role"], st.session
 st.sidebar.write(f"{t['signed']} **{pname}**")
 st.sidebar.caption(t["caregiver"] if role == "caregiver" else t["patient"])
 if st.sidebar.button(t["signout"], use_container_width=True):
-    end_session()
-    st.session_state.clear(); st.session_state["_clear_cookie"] = True; st.rerun()
-if st.session_state.get("_set_cookie"):
-    cookie_js(st.session_state.pop("_set_cookie"))
+    st.session_state.clear(); st.rerun()
 if st_autorefresh:
     st_autorefresh(interval=30000, key="tick")
 
@@ -508,8 +518,7 @@ with st.sidebar.expander(t["change_pin"]):
         np_ = st.text_input(t["new_pin"], type="password", max_chars=4)
         if st.form_submit_button(t["save"], use_container_width=True):
             if np_.isdigit() and len(np_) == 4:
-                db.execute("update patients set pin_hash=? where id=?", (hash_pin(np_), pid))
-                db.execute("delete from sessions where patient_id=? and role='caregiver'", (pid,)); db.commit()
+                db.execute("update patients set pin_hash=? where id=?", (hash_pin(np_), pid)); db.commit()
                 st.success(t["pin_saved"])
             else:
                 st.error(t["bad_pin"])
