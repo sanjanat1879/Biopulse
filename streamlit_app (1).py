@@ -364,6 +364,16 @@ if "pid" not in st.session_state:
                     login(db.execute("select * from patients where id=?", (cur.lastrowid,)).fetchone(), "patient")
     if st.session_state.pop("_clear_cookie", False):
         cookie_js("")
+    with st.expander("ℹ️ Sign-in status (for troubleshooting)"):
+        tok = browser_token()
+        row = db.execute("select * from sessions where token_hash=?", (_h(tok),)).fetchone() if tok else None
+        n_ses = db.execute("select count(*) from sessions").fetchone()[0]
+        st.write(f"Streamlit version: **{st.__version__}** (auto sign-in needs 1.37 or newer)")
+        st.write(f"Login cookie received from this browser: **{'yes' if tok else 'no'}**")
+        st.write("Saved login found in database: **" + ("yes" if row and row["expires"] >= now().isoformat()
+                 else "expired" if row else "no") + "**")
+        st.write(f"Saved logins in database: **{n_ses}**")
+        st.caption(f"Database file: {os.path.abspath(DB_PATH)}")
     disclaimer(t)
     st.stop()
 
